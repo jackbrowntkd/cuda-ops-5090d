@@ -26,9 +26,13 @@
 // 用「模板 __device__ 函数 + 两个普通名字的 __global__ 包装」而不是直接模板化 kernel：
 // 模板 kernel 的名字会被 mangle（_ZN13matmul_tiledILi128E...），
 // 而本地验证框架是按**普通符号名**找 kernel 的，mangle 后就调不到了。
-template <int XBM, int XBN, int XWM, int XWN, int XWNITER, int NTHR, bool GUARD>
+// ATOMIC=true 时把累加结果 atomicAdd 进 C（供 split-K 用），否则直接赋值。
+// tBegin/tEnd 限定收缩维区间（默认 0..N）；split-K 时每个 block 只算自己那一段。
+template <int XBM, int XBN, int XWM, int XWN, int XWNITER, int NTHR,
+          bool GUARD, bool ATOMIC = false>
 __device__ __forceinline__ void gemm_body(const float* __restrict__ A, const float* __restrict__ B,
-                          float* __restrict__ C, int M, int N, int K) {
+                          float* __restrict__ C, int M, int N, int K,
+                          int tBegin = 0, int tEnd = -1) {
     constexpr int WARPS_N = XBN / XWN;
     constexpr int WMITER = (XWM * XWN) / (32 * XTM * XTN * XWNITER);
     constexpr int WSUBM = XWM / WMITER;
@@ -74,7 +78,8 @@ __device__ __forceinline__ void gemm_body(const float* __restrict__ A, const flo
 
     // 收缩维是 N（A 是 M×N、B 是 N×K）—— 写成 K 会让 N>K 的形状漏掉一段收缩，
     // 而 N==K / N<K 会「碰巧」正确，这类 bug 极难被小用例发现。
-    for (int t = 0; t < N; t += XBK) {
+    if (tEnd < 0) tEnd = N;
+    for (int t = tBegin; t < tEnd; t += XBK) {
 #pragma unroll
         for (int off = 0; off + rowStrideA <= XBM; off += rowStrideA) {
             const int r = rowStart + innerRowA + off;
@@ -164,7 +169,12 @@ __device__ __forceinline__ void gemm_body(const float* __restrict__ A, const flo
                               + threadRowInWarp * XTM + i;
                 const int c = colStart + warpCol * XWN + b * WSUBN
                               + threadColInWarp * XTN;
-                if (!GUARD) {
+                if (ATOMIC) {
+                    // split-K：多个 block 往同一片 C 累加
+#pragma unroll
+                    for (int j = 0; j < XTN; ++j)
+                        atomicAdd(&C[(size_t)r * K + c + j], acc[a][i][b][j]);
+                } else if (!GUARD) {
                     *reinterpret_cast<float4*>(&C[(size_t)r * K + c]) =
                         make_float4(acc[a][i][b][0], acc[a][i][b][1],
                                     acc[a][i][b][2], acc[a][i][b][3]);
@@ -206,6 +216,22 @@ matmul_small_safe(const float* __restrict__ A, const float* __restrict__ B,
     gemm_body<32, 32, 32, 32, 1, 32, true>(A, B, C, M, N, K);
 }
 
+// split-K：把收缩维 N 切成若干段，每个 block 只算一段，用 atomicAdd 累加到同一片 C。
+// 用途是**窄长输出**（M 小、K 大）—— 这时 128x128 tile 的 block 数 (K/128)*(M/128)
+// 往往填不满 SM（512x4096x4096 只有 128 个 block），但它的**数据复用率是好的**；
+// 切 K 就能在不牺牲复用率的前提下把 block 数乘上去
+// （对比：换 32x32 小 tile 虽然 block 数够，但复用率差 8 倍）。
+// ⚠️ 用之前必须先把 C 清零，否则 atomicAdd 会累加到垃圾值上。
+__global__ void __launch_bounds__(256)
+matmul_splitk(const float* __restrict__ A, const float* __restrict__ B,
+              float* __restrict__ C, int M, int N, int K, int per) {
+    const int t0 = blockIdx.z * per;
+    if (t0 >= N) return;
+    int t1 = t0 + per;
+    if (t1 > N) t1 = N;
+    gemm_body<128, 128, 64, 32, 2, 256, false, true>(A, B, C, M, N, K, t0, t1);
+}
+
 static int g_sm_count = 0;
 
 // 无 guard 快路径的适用条件：所有 tile 都不会跨越边界，且 float4 行距对齐。
@@ -228,6 +254,19 @@ extern "C" void solve(const float* A, const float* B, float* C,
     //         不能 -> 小 tile（block 数 ×16）。交叉点实测就在 SM 数附近。
     const long long nblk_big =
         (long long)((M + 127) / 128) * ((K + 127) / 128);
+    // 窄长输出（K/M >= 4）：128 tile 的 block 数不够填满 SM，但复用率好
+    // => 用 split-K 把 block 数乘上去（而不是换小 tile，小 tile 复用率差 8 倍）。
+    const bool narrow = (M > 0) && (K >= 4LL * M);
+    long long split_ks = 1, split_per = 0;
+    if (narrow && (N % XBK == 0) && nblk_big > 0) {
+        split_ks = ((long long)g_sm_count * 2 + nblk_big - 1) / nblk_big;
+        if (split_ks < 1) split_ks = 1;
+        // 每段长度取 XBK 的倍数，保证每段都是对齐的整 tile；N%16==0 保证末段也在界内
+        split_per = ((long long)(N / split_ks) / XBK) * XBK;
+        if (split_per < XBK) split_per = XBK;
+        split_ks = (N + split_per - 1) / split_per;
+    }
+
     // ⚠️ 窄长输出（K/M >= 4）仍是**未解决的短板**（实测 0.51x）。
     //    试过加一档 32x128 的非方形 tile（理论上把共享载入/计算比从 0.125 降到 0.039），
     //    但**结果算错了**（M256N256K256 上 diff=50 而期望 0.13），没能在预算内定位，
@@ -240,8 +279,14 @@ extern "C" void solve(const float* A, const float* B, float* C,
         } else {
             matmul_big_safe<<<dim3((K + 127) / 128, (M + 127) / 128), dim3(256)>>>(A, B, C, M, N, K);
         }
+    } else if (narrow && tile_aligned(M, N, K, 128, 128)
+               && nblk_big * split_ks >= (long long)g_sm_count) {
+        // 判据 2：窄长输出 -> split-K（只在形状对齐时启用，走无 guard 快路径）
+        cudaMemsetAsync(C, 0, (size_t)M * K * sizeof(float));
+        matmul_splitk<<<dim3((K + 127) / 128, (M + 127) / 128, (unsigned)split_ks),
+                        dim3(256)>>>(A, B, C, M, N, K, (int)split_per);
     } else {
-        // 判据 2：形状对齐与否 -> 无 guard 快路径 / 带 guard 安全路径
+        // 判据 3：形状对齐与否 -> 无 guard 快路径 / 带 guard 安全路径
         if (tile_aligned(M, N, K, 32, 32)) {
             matmul_small<<<dim3((K + 31) / 32, (M + 31) / 32), dim3(32)>>>(A, B, C, M, N, K);
         } else {

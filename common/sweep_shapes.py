@@ -156,15 +156,31 @@ def bench_single_f32(r, blas, shapes):
         dA, dB = rr.to_device(A), rr.to_device(Bm)
         dC = rr.alloc(M * K * 4)
         flop = 2.0 * M * N * K
-        # 复刻 solve() 里的自适应分派：128 tile 的 block 数能否填满 SM
+        # 复刻 solve() 的三条判据：block 数 / 窄长 split-K / 对齐
         SM_N = 170
         nb_big = ((M + 127) // 128) * ((K + 127) // 128)
+        narrow = K >= 4 * M
+        _ks = 1
+        _per = 0
+        if narrow and N % 16 == 0 and nb_big > 0:
+            _ks = (SM_N * 2 + nb_big - 1) // nb_big
+            _per = ((N // _ks) // 16) * 16
+            if _per < 16: _per = 16
+            _ks = (N + _per - 1) // _per
         if nb_big >= SM_N:
             _k, _g, _b = "matmul_big", ((K + 127) // 128, (M + 127) // 128, 1), (256, 1, 1)
+            ours = lambda: rr.launch(_k, _g, _b,
+                                     [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
+        elif narrow and _ks > 1 and nb_big * _ks >= SM_N:
+            def ours():
+                rr.launch("matmul_splitk", ((K + 127) // 128, (M + 127) // 128, _ks),
+                          (256, 1, 1),
+                          [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K), rr.i(_per)])
+            _k, _t = "splitk", _ks
         else:
             _k, _g, _b = "matmul_small", ((K + 31) // 32, (M + 31) // 32, 1), (32, 1, 1)
-        ours = lambda: rr.launch(_k, _g, _b,
-                                 [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
+            ours = lambda: rr.launch(_k, _g, _b,
+                                     [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
         vend = lambda: blas.gemm_f32(dA, dB, dC, M, K, N, 1.0, 0.0)
         try:
             ours(); rr.sync()
@@ -181,7 +197,8 @@ def bench_single_f32(r, blas, shapes):
         ratios.append(rat)
         mark = " 🏆" if rat > 1.0 else ""
         print("  %-6s %-28s %9.1f G %9.1f G %8.2fx%-8s%s"
-              % ("f32", label, go, gv, rat, " [" + _k.replace("matmul_", "") + "]", mark))
+              % ("f32", label, go, gv, rat,
+             " [" + (_k.replace("matmul_", "") + ("x%d" % _t if _k == "splitk" else "")) + "]", mark))
         for p in (dA, dB, dC):
             rr.free(p)
     return ratios

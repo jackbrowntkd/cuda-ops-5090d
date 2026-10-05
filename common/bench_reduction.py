@@ -31,7 +31,9 @@ RMAXG = 1024
 def run_reduce_sub(r, dIn, dOut, N, S, E):
     """#047 专用：stage1 的签名是 (dIn, part, S, E)，不是通用的 (ins..., part, N)。"""
     length = E - S + 1
-    grid = min(RMAXG, max(1, (length + RBLOCK - 1) // RBLOCK))
+    vec = ((S & 3) == 0) and (length >= 4)
+    units = (length >> 2) if vec else length
+    grid = min(65535, max(1, (units + RBLOCK - 1) // RBLOCK))
     part = r.alloc(grid * 4)
     r.launch("sub_stage1", grid, RBLOCK, [dIn, part, r.i(S), r.i(E)])
     r.launch("sub_stage2", 1, RBLOCK, [part, dOut, r.i(grid)])
