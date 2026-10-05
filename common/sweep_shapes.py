@@ -141,8 +141,14 @@ def bench_single_f32(r, blas, shapes):
         dA, dB = rr.to_device(A), rr.to_device(Bm)
         dC = rr.alloc(M * K * 4)
         flop = 2.0 * M * N * K
-        ours = lambda: rr.launch("matmul_v10",
-                                 ((K + 127) // 128, (M + 127) // 128, 1), (256, 1, 1),
+        # 复刻 solve() 里的自适应分派：128 tile 的 block 数能否填满 SM
+        SM_N = 170
+        nb_big = ((M + 127) // 128) * ((K + 127) // 128)
+        if nb_big >= SM_N:
+            _k, _g, _b = "matmul_big", ((K + 127) // 128, (M + 127) // 128, 1), (256, 1, 1)
+        else:
+            _k, _g, _b = "matmul_small", ((K + 31) // 32, (M + 31) // 32, 1), (32, 1, 1)
+        ours = lambda: rr.launch(_k, _g, _b,
                                  [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
         vend = lambda: blas.gemm_f32(dA, dB, dC, M, K, N, 1.0, 0.0)
         try:
@@ -159,8 +165,8 @@ def bench_single_f32(r, blas, shapes):
         rat = go / gv
         ratios.append(rat)
         mark = " 🏆" if rat > 1.0 else ""
-        print("  %-6s %-28s %9.1f G %9.1f G %8.2fx%s"
-              % ("f32", label, go, gv, rat, mark))
+        print("  %-6s %-28s %9.1f G %9.1f G %8.2fx%-8s%s"
+              % ("f32", label, go, gv, rat, " [" + _k.replace("matmul_", "") + "]", mark))
         for p in (dA, dB, dC):
             rr.free(p)
     return ratios
