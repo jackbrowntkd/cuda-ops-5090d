@@ -1,0 +1,143 @@
+# 5090D CUDA 算子优化系列
+
+在 **RTX 5090 D（sm_120，170 SM）** 上，用「厂商库基线 → 差距量化 → 抄开源实现的结构 →
+参数扫描与归因 → 平台榜单」的闭环，逐个算子做性能对标与优化。
+
+不是"跑通就跑"的 kernel 集合，而是**每一步都有可量的数字、可复现的命令、以及明确标注的
+"哪些结论依赖机器规模"**。
+
+---
+
+## 一、先立两个天花板
+
+优化之前必须先知道天花板在哪，否则不知道还差多少。
+
+| 天花板 | 本机实测 | 对标哪类算子 |
+|---|---|---|
+| **D2D 显存带宽** | **1 514.9 GB/s** | 纯 elementwise / 数据搬运（= 理论上限） |
+| **cuBLAS fp32 FFMA** | ~63~68 TFLOPS | 计算密集型（fp32） |
+
+> ⚠️ **「5090 的 fp32 = 116 TFLOPS」是 TF32 张量核，不是真 FFMA。**
+> 真 fp32（PyTorch 默认不开 tf32 实测 66.4 / 本机 `CUBLAS_COMPUTE_32F` 实测 68）≈ **66~68 TFLOPS**。
+> 这个区分很关键 —— 报"和 cuBLAS 的比值"时不说清路径，数字就是错的。
+>
+> 本机带宽实测与第三方 [`binbinsh/gpu-bench`](https://github.com/binbinsh/gpu-bench) 的
+> 1 528.8 GB/s 只差 **0.9%**，交叉验证通过。
+
+---
+
+## 二、差距总表（**本仓库的核心产出**）
+
+规模全部取自各题题面写明的**性能测试规模**，不是自己另选。
+
+| 算子 | 我们的实现 | 厂商库 | 差距 | headroom |
+|---|---|---|---|---|
+| fp16 GEMM（1024³） | 159 657 GFLOPS | 212 572 | **0.75×** | 1.3× |
+| fp32 GEMM（8192×6144×4096） | 5 876 GFLOPS | 62 986 | **0.09×** | **~11×** |
+| fp32 batched（256³×128） | 5 929 GFLOPS | 38 599 | **0.15×** | **6.5×** |
+| fp16 batched（256³×128） | 6 242 GFLOPS | 95 546 | **0.07×** | **15×** |
+| int8 MatMul（8192×4096×2048） | 6 463 GFLOPS | 217 487 ⚠️ | 0.03× | ~34× |
+
+⚠️ **int8 那行不是严格可比**：cuBLAS 侧是纯 int8 GEMM（int32 累加），**不含
+zero_point / scale 校正**，只能当"忽略零点校正的理论上界"。
+
+### 三条结论
+
+1. **fp32 GEMM 已经做到厂商库的 0.85×。** 完整阶梯见 [`docs/GEMM-PERF.md`](docs/GEMM-PERF.md)：
+   从 naive 6 950 GFLOPS 一路到 v10d 的 57 700（4096³），中间每一步的增益都是分开量的。
+2. **几个 batch 类实现还停在 ~6 TFLOPS** —— 那是"只为通过正确性"写的朴素 tiled 版本，
+   没做过优化。**这就是 rest 的 headroom。**
+3. ⭐ **小尺寸 batched 是厂商库的弱区**：256³×128 时 cuBLAS 只有 38.6（fp32）/ 95.5（fp16）
+   TFLOPS，而同类的**大尺寸单发**是 65.6 / 236 TFLOPS。
+   → **小尺寸 + 多 batch 正是手写容易追平甚至反超厂商库的窗口。**
+
+---
+
+## 三、目录
+
+```
+common/                     # 复用的基础设施（全部自己写的）
+  localrun.py               #   NVRTC + Driver API 的 kernel 跑测框架（绕开 nvcc 不可用）
+  cublas.py                 #   cuBLAS 基线封装（ctypes；含列主序映射 + GEMM 家族各接口）
+  vendor_baseline.py        #   量 D2D 带宽上限 + GEMM 家族厂商基线
+  bench_ours_vs_vendor.py   #   逐题「我们 vs 厂商库」，含各题 kernel 分派的显式声明
+
+gemm-fp32/
+  ladder_fp32.py            #   fp32 SGEMM 十一级阶梯（tiling/reg/float4/warp 逐项拆解）
+
+gemm-fp16/
+  ladder_fp16.py            #   fp16 GEMM 十二个变体（含 WMMA / warp 分块 / cuBLAS 对照）
+  solution_wmma_bk64.cu     #   最终解答（WMMA，BK=64），已在平台通过全部隐藏用例
+
+docs/
+  BASELINE.md               # 基线对标报告：天花板、差距总表、全部算子按类型的基线分类
+  GEMM-PERF.md              # GEMM 完整性能报告（含反例与归因分析）
+```
+
+---
+
+## 四、方法论（六步闭环）
+
+1. **确认架构**：sm_120 走的是 Ampere 那代的 `mma.sync`（warp 级、寄存器到寄存器），
+   **不是** SM100 的 `tcgen05`、**也不是** SM90 的 `wgmma`。
+   → DeepGEMM / CUTLASS SM100 collective / WGMMA 版 flash-attention **在 5090 上编不过或崩**。
+   能用的是 WMMA、`mma.sync` PTX、`cp.async`。
+2. **量厂商基线**：每个算子都有基线。计算密集 → cuBLAS/cuDNN/CUB；
+   **纯 elementwise → D2D 带宽即上限**。
+3. **量化差距**：见下面的测量纪律。
+4. **抄参考的结构**：⚠️ **抄结构，别抄参数** —— 把别处调好的 tile/线程数直接搬过来会翻车
+   （见 `docs/GEMM-PERF.md` 里的 v10 vs v10d）。
+5. **参数扫描 + 归因**：一次动一两个维度、每格重复 3 次取中位数、
+   **把"可归因"和"不可归因"分开写**。
+6. **提交与榜单**：榜单每张卡只返回前 3 名；`isPublic=true` 只是必要条件，进前 3 才上榜。
+
+### ⚠️ 测量纪律（不遵守就会得出错结论）
+
+- **host launch floor**：ctypes 每次 `cuLaunchKernel` 有 **~7 µs** 固定开销。
+  `实测 / 7µs ≥ 4` 才可信；否则测到的是 host 抖动。
+  → fp16 GEMM 在 1024³ 上 cuBLAS 只要 17 µs（比值 2.5×）→ **那一行根本测不准**，
+  横向比较一律以 ≥2048³ 为准。
+- **不要"统一减去 7 µs"**：host < GPU 时实测值**已经**是 GPU 时间，再减会低估
+  （会让 cuBLAS 的 fp16 虚高到 224 TFLOPS，超过硬件密集算力）。
+  正确做法是**报告原始值 + 标注可信度**。
+- **单次测量不可信**：同一个 kernel 有一次跑出 27 029 GFLOPS，其余 5 次都是 55 600~59 200。
+  **改结论前重复 3~5 次。**
+
+---
+
+## 五、复现
+
+依赖：CUDA Toolkit（本仓库用 v12.8 的 `nvrtc64_120_0.dll` + `cublas64_12.dll`）、Python + numpy。
+**不需要 nvcc** —— 全部 kernel 走 NVRTC 编译。
+
+```bash
+cd common
+python vendor_baseline.py          # 带宽上限 + GEMM 家族厂商基线
+python vendor_baseline.py bw       # 只量带宽
+python bench_ours_vs_vendor.py     # 逐题差距
+
+cd ../gemm-fp32 && python ladder_fp32.py     # fp32 十一级阶梯
+cd ../gemm-fp16 && python ladder_fp16.py     # fp16 十二变体
+```
+
+> 注：原开发环境的 `nvcc` 不可用（`cl.exe` 会调用被安全策略拦截的 `reg.exe`），
+> 所以整套测试框架走 `NVRTC + CUDA Driver API`（纯 ctypes，零编译工具链依赖）。
+> 这个取舍也意味着**本仓库可以在没有完整 CUDA 工具链的 Windows 机器上复现**。
+
+---
+
+## 六、参考与致谢
+
+本仓库的实现思路参考了以下开源项目（**只参考方法论与结构，未复制其源码**）：
+
+- [siboehm/SGEMM_CUDA](https://github.com/siboehm/SGEMM_CUDA) —— fp32 SGEMM 的十级优化阶梯，
+  warp tiling 在 A6000 上达到 cuBLAS 的 93.7%
+- [Bruce-Lee-LY/cuda_hgemm](https://github.com/Bruce-Lee-LY/cuda_hgemm) —— fp16 HGEMM 的
+  WMMA / MMA PTX 双路线阶梯（padding / async / pg2s / ps2r / multi-stage）
+- [yzhaiustc/Optimizing-SGEMM-on-NVIDIA-Turing-GPUs](https://github.com/yzhaiustc/Optimizing-SGEMM-on-NVIDIA-Turing-GPUs)
+- [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass) —— `examples/79_blackwell_geforce_gemm`
+  （sm_120 的官方写法）
+
+## 七、License
+
+MIT（`common/` 与各 `ladder_*.py` 为本仓库原创）。
