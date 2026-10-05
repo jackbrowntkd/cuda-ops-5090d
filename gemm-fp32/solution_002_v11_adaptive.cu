@@ -228,6 +228,12 @@ extern "C" void solve(const float* A, const float* B, float* C,
     //         不能 -> 小 tile（block 数 ×16）。交叉点实测就在 SM 数附近。
     const long long nblk_big =
         (long long)((M + 127) / 128) * ((K + 127) / 128);
+    // ⚠️ 窄长输出（K/M >= 4）仍是**未解决的短板**（实测 0.51x）。
+    //    试过加一档 32x128 的非方形 tile（理论上把共享载入/计算比从 0.125 降到 0.039），
+    //    但**结果算错了**（M256N256K256 上 diff=50 而期望 0.13），没能在预算内定位，
+    //    于是回退 —— 发布一个算错的 kernel 比不做更糟。
+    //    下一步应该走 **split-K**（沿收缩维切分再加归约），而不是指望换 tile 形状。
+
     if (nblk_big >= (long long)g_sm_count) {
         if (tile_aligned(M, N, K, 128, 128)) {
             matmul_big<<<dim3((K + 127) / 128, (M + 127) / 128), dim3(256)>>>(A, B, C, M, N, K);

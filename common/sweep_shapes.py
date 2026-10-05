@@ -94,15 +94,29 @@ def bench_batched(r, blas, kind, shapes):
         flop = 2.0 * M * N * K * B
 
         if kind == "f32b":
-            ours = lambda: rr.launch("bmm_v10",
-                                     ((N + 127) // 128, (M + 127) // 128, B),
-                                     (256, 1, 1),
+            # 复刻 bmm solve() 的分派：判据要把 batch 乘进去
+            SM_N = 170
+            nb_big = ((M + 127) // 128) * ((N + 127) // 128) * B
+            if nb_big >= SM_N:
+                _k, _t, _nt = "bmm_big", 128, 256
+            else:
+                _k, _t, _nt = "bmm_small", 32, 32
+            ours = lambda: rr.launch(_k,
+                                     ((N + _t - 1) // _t, (M + _t - 1) // _t, B),
+                                     (_nt, 1, 1),
                                      [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
             vend = lambda: blas.gemm_f32_batched(dA, dB, dC, M, N, K, B, 1.0, 0.0)
         else:
-            ours = lambda: rr.launch("fp16_bmm_wmma",
-                                     ((N + 63) // 64, (M + 63) // 64, B),
-                                     (128, 1, 1),
+            # 复刻 fp16_bmm solve() 的三档分派
+            SM_N = 170
+            n64 = ((M + 63) // 64) * ((N + 63) // 64) * B
+            if n64 >= SM_N // 4:
+                _k2, _t2, _nt2 = "fp16_bmm_t64", 64, 128
+            else:
+                _k2, _t2, _nt2 = "fp16_bmm_t32", 32, 32
+            ours = lambda: rr.launch(_k2,
+                                     ((N + _t2 - 1) // _t2, (M + _t2 - 1) // _t2, B),
+                                     (_nt2, 1, 1),
                                      [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
             vend = lambda: blas.gemm_f16_batched(dA, dB, dC, M, N, K, B, 1.0, 0.0)
 
@@ -120,8 +134,9 @@ def bench_batched(r, blas, kind, shapes):
         rat = go / gv
         ratios.append(rat)
         mark = " 🏆" if rat > 1.0 else ""
-        print("  %-6s %-28s %9.1f G %9.1f G %8.2fx%s"
-              % (kind, label, go, gv, rat, mark))
+        tag = (" [" + (_k if kind == "f32b" else _k2).replace("bmm_", "").replace("fp16_", "") + "]")
+        print("  %-6s %-28s %9.1f G %9.1f G %8.2fx%-8s%s"
+              % (kind, label, go, gv, rat, tag, mark))
         for p in (dA, dB, dC):
             rr.free(p)
     return ratios
