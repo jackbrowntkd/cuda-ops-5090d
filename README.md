@@ -104,6 +104,7 @@ common/                     # 复用的基础设施（全部自己写的）
   bench_ours_vs_vendor.py   #   逐题「我们 vs 厂商库」，含各题 kernel 分派的显式声明
   sweep_shapes.py           #   ⭐ 多形状扫描（几何平均 + 最差/最好 + 胜负计数）
   verify_algo_choice.py     #   ⭐ 扫 cuBLAS 的 algo 选项，排除"我们调用方式不对"
+  bench_elementwise.py      #   ⭐ 纯带宽型算子：相对 memcpy 上限的达标率（含 L2/host 两个可信度判据）
 
 gemm-fp32/
   ladder_fp32.py            #   fp32 SGEMM 十一级阶梯（tiling/reg/float4/warp 逐项拆解）
