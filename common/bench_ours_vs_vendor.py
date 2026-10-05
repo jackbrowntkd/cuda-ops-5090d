@@ -18,22 +18,8 @@ sys.path.insert(0, HERE)
 from localrun import Runner, nvrtc_compile  # noqa: E402
 from cublas import Handle  # noqa: E402
 
-WORK = os.environ.get(
-    "SOLUTIONS_DIR",
-    os.path.abspath(os.path.join(HERE, "..", "..", "leetgpu-work")))
-# ⚠️ 本仓库不含各题的题面与解答（版权归平台），这个脚本需要你自己准备一个目录，
-# 里面每个子目录放一份 solution.cu。用环境变量指定：
-#     export SOLUTIONS_DIR=/path/to/your/solutions
+WORK = os.path.abspath(os.path.join(HERE, ".."))
 HOST_FLOOR_MS = 6.5e-3      # vendor_baseline.py 实测的 host launch floor（ms）
-
-
-def find_solution(subdir):
-    p = os.path.join(WORK, subdir, "solution.cu")
-    if not os.path.isfile(p):
-        raise FileNotFoundError(
-            "找不到 %s\n  当前 SOLUTIONS_DIR = %s\n"
-            "  请设置环境变量 SOLUTIONS_DIR 指向你的解答目录。" % (p, WORK))
-    return p
 
 _NOOP = r"""
 __global__ void noop_probe(float* p) { if (p && threadIdx.x > 1024) p[0] = 1.f; }
@@ -45,11 +31,13 @@ def flag(ms):
     return "OK" if r >= 4 else "~host(%.1fx)" % r
 
 
-def run_ours(r, kernel, grid, block, args, repeat=20, warmup=5):
-    r.launch(kernel, grid, block, args)
+def run_ours(r, kernel, grid, block, args, repeat=20, warmup=5, fn=None):
+    if fn is None:
+        def fn():
+            r.launch(kernel, grid, block, args)
+    fn()
     r.sync()
-    return r.timeit(lambda: r.launch(kernel, grid, block, args),
-                    repeat=repeat, warmup=warmup)
+    return r.timeit(fn, repeat=repeat, warmup=warmup)
 
 
 # --------------------------------------------------------------- 各题
@@ -61,7 +49,7 @@ def run_ours(r, kernel, grid, block, args, repeat=20, warmup=5):
 def case_002(r, blas):
     """#002 fp32 Matrix-Multiplication（A(M,N) @ B(N,K)，收缩维 N）"""
     M, N, K = 8192, 6144, 4096
-    path = find_solution("002-Matrix-Multiplication")
+    path = os.path.join(WORK, "002-Matrix-Multiplication", "solution.cu")
     rr = Runner.from_file(path)
     rng = np.random.default_rng(1)
     A = rng.standard_normal((M, N)).astype(np.float32)
@@ -69,8 +57,9 @@ def case_002(r, blas):
     dA, dB = rr.to_device(A), rr.to_device(B)
     dC = rr.alloc(M * K * 4)
     flop = 2.0 * M * N * K
-    ours_ms = run_ours(rr, "matmul_tiled", ((K + 31) // 32, (M + 31) // 32, 1),
-                       (32, 32, 1), [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
+    ours_ms = run_ours(rr, "matmul_v10",
+                       ((K + 127) // 128, (M + 127) // 128, 1), (256, 1, 1),
+                       [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
     # vendor：C(M×K) = A(M×N) × B(N×K) -> 传 (M, K, N)
     v = rr.timeit(lambda: blas.gemm_f32(dA, dB, dC, M, K, N, 1.0, 0.0),
                   repeat=20, warmup=5)
@@ -82,7 +71,7 @@ def case_002(r, blas):
 def case_030(r, blas):
     """#030 fp32 batched GEMM（B 在 gridDim.z）"""
     BATCH, M, N, K = 128, 256, 256, 256
-    path = find_solution("030-Batched-Matrix-Multiplication")
+    path = os.path.join(WORK, "030-Batched-Matrix-Multiplication", "solution.cu")
     rr = Runner.from_file(path)
     rng = np.random.default_rng(39)
     A = rng.standard_normal((BATCH, M, K)).astype(np.float32)
@@ -90,8 +79,8 @@ def case_030(r, blas):
     dA, dB = rr.to_device(A), rr.to_device(Bm)
     dC = rr.alloc(BATCH * M * N * 4)
     flop = 2.0 * M * N * K * BATCH
-    ours_ms = run_ours(rr, "bmm_tiled",
-                       ((N + 31) // 32, (M + 31) // 32, BATCH), (32, 32, 1),
+    ours_ms = run_ours(rr, "bmm_v10",
+                       ((N + 127) // 128, (M + 127) // 128, BATCH), (256, 1, 1),
                        [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
     v = rr.timeit(lambda: blas.gemm_f32_batched(dA, dB, dC, M, N, K, BATCH, 1.0, 0.0),
                   repeat=20, warmup=5)
@@ -103,7 +92,7 @@ def case_030(r, blas):
 def case_032(r, blas):
     """#032 INT8 Quantized MatMul（带 scale/zero_point）"""
     M, N, K = 8192, 4096, 2048
-    path = find_solution("032-INT8-Quantized-MatMul")
+    path = os.path.join(WORK, "032-INT8-Quantized-MatMul", "solution.cu")
     rr = Runner.from_file(path)
     rng = np.random.default_rng(22)
     A = rng.integers(-128, 128, (M, K), dtype=np.int8)
@@ -111,13 +100,21 @@ def case_032(r, blas):
     dA, dB = rr.to_device(A), rr.to_device(Bm)
     dC = rr.alloc(M * N)          # int8 输出
     dC32 = rr.alloc(M * N * 4)    # cuBLAS 的 int32 输出
+    dSumA, dSumB = rr.alloc(M * 4), rr.alloc(N * 4)
     flop = 2.0 * M * N * K
-    ours_ms = run_ours(rr, "i8_gemm", ((N + 15) // 16, (M + 15) // 16), (16, 16),
-                       [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K),
-                        rr.f(1.0), rr.f(1.0), rr.f(1.0), rr.i(0), rr.i(0), rr.i(0)])
+
+    def ours_call():
+        rr.launch("i8_rowsum", ((M + 255) // 256,), (256,),
+                  [dA, dSumA, rr.i(M), rr.i(K)])
+        rr.launch("i8_colsum", (N,), (256,), [dB, dSumB, rr.i(K), rr.i(N)])
+        rr.launch("i8_gemm_dp4a", ((N + 63) // 64, (M + 63) // 64), (256,),
+                  [dA, dB, dC, dSumA, dSumB, rr.i(M), rr.i(N), rr.i(K),
+                   rr.f(1.0), rr.f(1.0), rr.f(1.0), rr.i(0), rr.i(0), rr.i(0)])
+
+    ours_ms = run_ours(rr, "__fn__", None, None, None, fn=ours_call)
     v = rr.timeit(lambda: blas.gemm_int8(dA, dB, dC32, M, N, K, 1, 0),
                   repeat=20, warmup=5)
-    for p in (dA, dB, dC, dC32):
+    for p in (dA, dB, dC, dC32, dSumA, dSumB):
         rr.free(p)
     return flop, ours_ms, v, "⚠️ 非严格等价：cuBLAS 不含 zero_point/scale 校正"
 
@@ -125,7 +122,7 @@ def case_032(r, blas):
 def case_057(r, blas):
     """#057 FP16 batched GEMM（批在 gridDim.z）"""
     BATCH, M, N, K = 128, 256, 256, 256
-    path = find_solution("057-FP16-Batched-Matrix-Multiplication")
+    path = os.path.join(WORK, "057-FP16-Batched-Matrix-Multiplication", "solution.cu")
     rr = Runner.from_file(path)
     rng = np.random.default_rng(22)
     A = (rng.standard_normal((BATCH, M, K)) * 0.5).astype(np.float16)
@@ -133,8 +130,8 @@ def case_057(r, blas):
     dA, dB = rr.to_device(A), rr.to_device(Bm)
     dC = rr.alloc(BATCH * M * N * 2)
     flop = 2.0 * M * N * K * BATCH
-    ours_ms = run_ours(rr, "fp16_bmm",
-                       ((N + 15) // 16, (M + 15) // 16, BATCH), (16, 16),
+    ours_ms = run_ours(rr, "fp16_bmm_wmma",
+                       ((N + 63) // 64, (M + 63) // 64, BATCH), (128, 1, 1),
                        [dA, dB, dC, rr.i(M), rr.i(N), rr.i(K)])
     v = rr.timeit(lambda: blas.gemm_f16_batched(dA, dB, dC, M, N, K, BATCH, 1.0, 0.0),
                   repeat=20, warmup=5)
